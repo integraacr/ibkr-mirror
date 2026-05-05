@@ -7,51 +7,66 @@
 #
 # Save this file at the path:  .github/workflows/mirror-ibkr.yml
 #
-# Why this works: GitHub Actions runners run on Microsoft's network, which
-# doesn't block outbound port 21. So the FTP fetch that fails on residential
-# ISPs succeeds here, and the resulting file is then served over HTTPS by
-# raw.githubusercontent.com — which IS reachable from your home network.
+# CHANGE LOG
+# ----------
+# v1: ftp3.interactivebrokers.com only, 60s timeout, ubuntu-latest.
+# v2: Multi-host fallback (ftp3 → ftp2). Some IBKR FTP servers reject specific
+#     IP ranges or are intermittently overloaded; trying both improves the odds
+#     of at least one connection succeeding. Timeout raised to 90s.
 
 name: Mirror IBKR shortstock
 
 on:
-  # Schedule: every 4 hours (UTC). Times are roughly 4am/8am/12pm/4pm/8pm/12am ET.
-  # IBKR updates the file periodically through the day, so 4-hour cadence captures
-  # most refreshes without burning Actions quota (free tier = 2,000 min/month,
-  # this workflow uses ~30 sec per run = ~7.5 min/day = ~225 min/month).
   schedule:
-    - cron: '0 */4 * * *'
-  # Manual trigger (handy for testing — go to Actions tab → click "Run workflow")
-  workflow_dispatch:
+    - cron: '0 */4 * * *'   # every 4 hours UTC
+  workflow_dispatch:         # allow manual trigger
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # needed to commit the updated usa.txt
+      contents: write
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Fetch usa.txt from IBKR FTP
+      - name: Fetch usa.txt from IBKR FTP (tries ftp3 then ftp2)
         run: |
           python3 <<'EOF'
-          import ftplib, sys, os
-          try:
-              ftp = ftplib.FTP('ftp3.interactivebrokers.com', timeout=60)
-              ftp.login('shortstock')  # anonymous-equivalent, blank password
-              with open('usa.txt', 'wb') as f:
-                  ftp.retrbinary('RETR usa.txt', f.write)
-              ftp.quit()
-              size = os.path.getsize('usa.txt')
-              print(f'OK: fetched {size} bytes')
-              if size < 100000:
-                  print('WARN: file unexpectedly small', file=sys.stderr)
-                  sys.exit(1)
-          except Exception as e:
-              print(f'FTP error: {type(e).__name__}: {e}', file=sys.stderr)
-              sys.exit(1)
+          import ftplib, os, sys, socket
+          # Both hosts publish the same usa.txt. ftp3 is the canonical one
+          # cited in IBKR's docs; ftp2 is documented for prime-trade uploads
+          # but historically also serves shortstock data.
+          hosts = [
+              'ftp3.interactivebrokers.com',
+              'ftp2.interactivebrokers.com',
+          ]
+          last_err = None
+          for host in hosts:
+              try:
+                  print(f'Trying {host} ...', flush=True)
+                  # 90s is generous - IBKR's FTP can be slow even when reachable
+                  ftp = ftplib.FTP(host, timeout=90)
+                  ftp.login('shortstock')  # blank password
+                  with open('usa.txt', 'wb') as f:
+                      ftp.retrbinary('RETR usa.txt', f.write)
+                  ftp.quit()
+                  size = os.path.getsize('usa.txt')
+                  if size < 100000:
+                      print(f'  WARN: {host} returned only {size} bytes - trying next host', flush=True)
+                      last_err = Exception(f'{host} returned tiny file ({size}b)')
+                      continue
+                  print(f'  OK from {host}: {size} bytes')
+                  sys.exit(0)
+              except Exception as e:
+                  err_type = type(e).__name__
+                  print(f'  {host} failed: {err_type}: {e}', flush=True)
+                  last_err = e
+          # All hosts failed
+          print(f'\nAll IBKR FTP hosts unreachable from this runner.', file=sys.stderr)
+          print(f'Last error: {type(last_err).__name__}: {last_err}', file=sys.stderr)
+          sys.exit(1)
           EOF
 
       - name: Commit updated usa.txt (if changed)
@@ -59,10 +74,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add usa.txt
-          # Only commit if the file actually changed (avoids empty commits)
           if ! git diff --cached --quiet; then
             git commit -m "Update usa.txt $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push
           else
-            echo "No changes — skipping commit"
+            echo "No changes - skipping commit"
           fi
