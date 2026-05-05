@@ -1,6 +1,5 @@
 # GitHub Actions workflow that mirrors IBKR's public shortstock FTP feed to
-# this repo as `usa.txt`. Runs every 4 hours during market hours plus a few
-# off-hours times for redundancy. Manual trigger available via "workflow_dispatch".
+# this repo as `usa.txt`.
 #
 # After the first successful run, your file will be available at:
 #   https://raw.githubusercontent.com/<YOUR_USERNAME>/<REPO_NAME>/main/usa.txt
@@ -11,21 +10,36 @@
 # ----------
 # v1: ftp3.interactivebrokers.com only, 60s timeout, ubuntu-latest.
 # v2: Multi-host fallback (ftp3 → ftp2). Some IBKR FTP servers reject specific
-#     IP ranges or are intermittently overloaded; trying both improves the odds
-#     of at least one connection succeeding. Timeout raised to 90s.
+#     IP ranges; trying both improves reachability. Timeout raised to 90s.
+# v3: 5-minute cadence (was 4 hours). 5 min is the GitHub Actions cron floor.
+#     Public repos have unlimited Actions minutes, so the cadence is free; the
+#     only cost is occasional commit noise (the "if changed" guard prevents
+#     spurious commits when usa.txt hasn't actually changed). Note: GitHub
+#     throttles cron triggers during peak load so actual cadence is often
+#     closer to 5-15 min in practice — best-effort, not guaranteed.
 
 name: Mirror IBKR shortstock
 
 on:
   schedule:
-    - cron: '0 */4 * * *'   # every 4 hours UTC
-  workflow_dispatch:         # allow manual trigger
+    # Every 5 minutes — GitHub's enforced minimum. Their docs note schedules
+    # may be delayed during peak load. In practice this gives ~5-15 min lag,
+    # which is fine since IBKR's own usa.txt refresh cadence is ~15 min.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
+    # Concurrency control: if a previous run is still in flight when the next
+    # cron tick arrives, cancel the old one. Prevents pile-up if IBKR's FTP
+    # is slow during a particular window.
+    concurrency:
+      group: mirror-ibkr
+      cancel-in-progress: true
 
     steps:
       - name: Checkout repo
@@ -34,10 +48,9 @@ jobs:
       - name: Fetch usa.txt from IBKR FTP (tries ftp3 then ftp2)
         run: |
           python3 <<'EOF'
-          import ftplib, os, sys, socket
-          # Both hosts publish the same usa.txt. ftp3 is the canonical one
-          # cited in IBKR's docs; ftp2 is documented for prime-trade uploads
-          # but historically also serves shortstock data.
+          import ftplib, os, sys
+          # Both hosts publish the same usa.txt. ftp3 is cited in IBKR's docs;
+          # ftp2 is also live and serves the same data.
           hosts = [
               'ftp3.interactivebrokers.com',
               'ftp2.interactivebrokers.com',
@@ -46,9 +59,8 @@ jobs:
           for host in hosts:
               try:
                   print(f'Trying {host} ...', flush=True)
-                  # 90s is generous - IBKR's FTP can be slow even when reachable
                   ftp = ftplib.FTP(host, timeout=90)
-                  ftp.login('shortstock')  # blank password
+                  ftp.login('shortstock')
                   with open('usa.txt', 'wb') as f:
                       ftp.retrbinary('RETR usa.txt', f.write)
                   ftp.quit()
@@ -63,7 +75,6 @@ jobs:
                   err_type = type(e).__name__
                   print(f'  {host} failed: {err_type}: {e}', flush=True)
                   last_err = e
-          # All hosts failed
           print(f'\nAll IBKR FTP hosts unreachable from this runner.', file=sys.stderr)
           print(f'Last error: {type(last_err).__name__}: {last_err}', file=sys.stderr)
           sys.exit(1)
@@ -74,6 +85,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add usa.txt
+          # Only commit if file actually changed — most 5-min ticks will be
+          # no-ops since IBKR refreshes ~every 15 min, and this prevents
+          # unnecessary commit history bloat.
           if ! git diff --cached --quiet; then
             git commit -m "Update usa.txt $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push
