@@ -1,0 +1,68 @@
+# GitHub Actions workflow that mirrors IBKR's public shortstock FTP feed to
+# this repo as `usa.txt`. Runs every 4 hours during market hours plus a few
+# off-hours times for redundancy. Manual trigger available via "workflow_dispatch".
+#
+# After the first successful run, your file will be available at:
+#   https://raw.githubusercontent.com/<YOUR_USERNAME>/<REPO_NAME>/main/usa.txt
+#
+# Save this file at the path:  .github/workflows/mirror-ibkr.yml
+#
+# Why this works: GitHub Actions runners run on Microsoft's network, which
+# doesn't block outbound port 21. So the FTP fetch that fails on residential
+# ISPs succeeds here, and the resulting file is then served over HTTPS by
+# raw.githubusercontent.com — which IS reachable from your home network.
+
+name: Mirror IBKR shortstock
+
+on:
+  # Schedule: every 4 hours (UTC). Times are roughly 4am/8am/12pm/4pm/8pm/12am ET.
+  # IBKR updates the file periodically through the day, so 4-hour cadence captures
+  # most refreshes without burning Actions quota (free tier = 2,000 min/month,
+  # this workflow uses ~30 sec per run = ~7.5 min/day = ~225 min/month).
+  schedule:
+    - cron: '0 */4 * * *'
+  # Manual trigger (handy for testing — go to Actions tab → click "Run workflow")
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to commit the updated usa.txt
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Fetch usa.txt from IBKR FTP
+        run: |
+          python3 <<'EOF'
+          import ftplib, sys, os
+          try:
+              ftp = ftplib.FTP('ftp3.interactivebrokers.com', timeout=60)
+              ftp.login('shortstock')  # anonymous-equivalent, blank password
+              with open('usa.txt', 'wb') as f:
+                  ftp.retrbinary('RETR usa.txt', f.write)
+              ftp.quit()
+              size = os.path.getsize('usa.txt')
+              print(f'OK: fetched {size} bytes')
+              if size < 100000:
+                  print('WARN: file unexpectedly small', file=sys.stderr)
+                  sys.exit(1)
+          except Exception as e:
+              print(f'FTP error: {type(e).__name__}: {e}', file=sys.stderr)
+              sys.exit(1)
+          EOF
+
+      - name: Commit updated usa.txt (if changed)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add usa.txt
+          # Only commit if the file actually changed (avoids empty commits)
+          if ! git diff --cached --quiet; then
+            git commit -m "Update usa.txt $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          else
+            echo "No changes — skipping commit"
+          fi
