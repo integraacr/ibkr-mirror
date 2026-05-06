@@ -25,7 +25,7 @@ on:
     # Every 5 minutes — GitHub's enforced minimum. Their docs note schedules
     # may be delayed during peak load. In practice this gives ~5-15 min lag,
     # which is fine since IBKR's own usa.txt refresh cadence is ~15 min.
-    - cron: '*/5 * * * *'
+    - cron: '* * * * *'
   workflow_dispatch:
 
 jobs:
